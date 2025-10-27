@@ -1,0 +1,921 @@
+---
+title: "Project Plan & EDA"
+author: "W06G08"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    self_contained: true
+    code_folding: hide
+    code_download: true
+    toc: true
+    toc_float: true
+    number_sections: false
+    fig_caption: true
+  word_document:
+    toc: true
+  pdf_document:
+    toc: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r warning=FALSE, message = FALSE}
+library(ggplot2)     
+library(dplyr)       
+library(tidyr)  
+library(cowplot)
+library(gridExtra) 
+library(corrplot)    
+library(GGally)  
+library(factoextra) 
+library(readxl)
+library(kknn)
+library(caret)
+library(MASS)
+library(e1071)
+library(randomForest)
+library(reshape2)
+library(knitr)
+library(nnet)
+library(glmnet)
+```
+
+## 1.Problem Overview
+
+The objective is to predict occupation based on individuals'
+socio-economic and demographic characteristics (such as age, education,
+relationship, etc.).This classification is helpful for recommending
+suitable occupations based on personal characteristics, and it can also
+help formulate corresponding educational and training plans according to
+the requirements of the occupations.
+
+## 2.Dataset Description, Cleaning and Preparation
+
+### 2.1 Describe the Data
+
+The dataset used in this project is derived from the 1994 US Census and
+contains 48,842 records. Each record contains 15 characteristics and is
+used to describe an individual's socioeconomic and demographic
+characteristics. These features include both numerical variables (such
+as age, education.num, hours.per.week)and categorical variables (such as
+workclass, marital.status, occupation, race, gender, native.country).
+The target variable of this study is "occupation", which initially
+contains 14 categories. Multiple variables show high cardinality and
+class imbalance, and there are missing values in occupation, workclass
+and native.country.
+
+### 2.2 Handle missing values and duplicate values
+
+In the first step of data cleaning, we examined the structure of the
+original data set and converted all "?" entries into standard missing
+values NA for unified processing. The following R code summarizes the
+statistics of missing values in each column:
+
+```{r message = FALSE}
+adult_data = read.csv('adult.csv',na.strings = "?")
+sapply(adult_data,function(x) sum(is.na(x)))
+```
+
+We then proceeded to handle missing values and duplicates as follows:\
+1. For the input variables workclass and native.country, we first
+converted them to character type to ensure correct assignment. Then,
+their missing values are filled with the new "Unknown" category instead
+of deleting the corresponding rows. Because this not only avoids
+deleting a large amount of data, but also enables the model to identify
+the possible predictive value of the missing information itself,
+maintaining data integrity and modeling rationality.\
+2. For the target variable occupation, we deleted all rows with missing
+labels (2809 samples). Because in supervised learning tasks, data
+without labels cannot participate in model training or evaluation, as
+the model cannot learn the mapping relationship of "input features →
+output occupational categories". Meanwhile, attempting to fill in the
+label values (such as using mode or model prediction) will not only
+introduce incorrect labels, but also may lead to model mislearning,
+bias, and reduce the final performance.\
+3. For duplicate records, we use the duplicated() function to identify
+and delete completely duplicate rows, ensuring that each sample in the
+dataset is unique.
+
+```{r}
+adult_data$workclass <- as.character(adult_data$workclass)
+adult_data$native.country <- as.character(adult_data$native.country)
+
+adult_data$workclass[is.na(adult_data$workclass)] <- "Unknown"
+adult_data$native.country[is.na(adult_data$native.country)] <- "Unknown"
+
+adult_data <- adult_data[!is.na(adult_data$occupation), ]
+
+adult_data <- adult_data[!duplicated(adult_data), ]
+```
+
+After dealing with the missing values and duplicate values, we retained
+45,985 unique and complete samples from the original 48,842 records as
+the cleaned dataset of our classification model.
+
+### 2.3 Delete useless or redundant variables
+
+In this section, we combined domain knowledge and the statistical
+characteristics of variables to evaluate the value of each feature for
+the occupational classification task, and removed some variables that
+were considered to be information-redundant, have limited contributions,
+or may affect the performance of the model. The specific handling is as
+follows:\
+1. **fnlwgt**:This field represents the sample weights in the census and
+is used to expand the sample to the overall population size. It does not
+contain feature information directly related to the occupation. If it is
+not processed and incorporated into the model, it may instead introduce
+errors. Therefore, we choose to delete it.\
+2. **education**:This is a categorical variable representing educational
+qualifications (such as "Bachelors", "HS-grad", etc.), and it is a
+completely correlated variable that corresponds one-to-one with
+education.num. Retaining both will introduce multicollinearity,
+especially having a significant impact on models such as logistic
+regression. Therefore, we choose to retain education.num because it is
+an ordered numerical variable, more compact, easier to model, does not
+require additional coding, and is more suitable for representing the
+level of education.\
+3. **capital.gain** and **capital.loss**:Over 90% of the values in both
+variables are zero, a skewed distribution that makes them narrowly
+variable in the data and limited in their contribution to the model's
+discriminatory power. So, we removed both.
+
+```{r message = FALSE}
+#sum(adult_data$capital.gain == 0) / nrow(adult_data) 
+#sum(adult_data$capital.loss == 0) / nrow(adult_data)
+adult_cleaned <- adult_data %>%
+  dplyr::select(-fnlwgt, -education, -capital.gain, -capital.loss)
+```
+
+### 2.4 Categorical Variable Grouping and Class Imbalance Handling
+
+In this section, we will address the class imbalance and high
+cardinality issues between the target variable (occupation) and several
+categorical input variables. Highly imbalanced or sparse categorical
+variables may lead to poor generalization, unstable model estimation, or
+inflated computational costs. Therefore, we have implemented grouping
+and simplification strategies for the following variables to improve the
+model's performance and interpretability.\
+(1) Occupation:The original 14 types of target variables were divided
+into 5 major categories (White-Collar, Blue-Collar, Office, Sales, and
+Service) to reduce class imbalance and simplify the classification
+task.\
+(2) Workclass:Merge the original seven types of jobs into four
+categories—Private, Self-Employed, Government, and Without-pay—to
+improve the representative balance and reduce the sparsity of the
+model.\
+(3) Native Country:Since over 90% of the individuals are from the United
+States, we classify all other countries as "Other" and retain "Unknown"
+as a separate category to reduce the dimension.\
+(4) Marital Status:Merge the original seven marital conditions into
+three categories: Married, Single, and Separated/Other.\
+(5) Race:Due to extreme imbalance (White \> 80%), all non-White groups
+were merged into a single category "Non-White", resulting in a binary
+race variable (White vs. Non-White).\
+(6) Relationship:Divide the original six types of relations into
+In-family, Unmarried, and Not-in-family to reduce redundancy and clarify
+semantic structure.
+
+```{r}
+#Check the specific distribution of these categorical variables
+distribution <- lapply(adult_cleaned[, c("occupation", "workclass", "native.country", "marital.status", "race", "relationship")], table)
+
+#(1)Target Variable: occupation
+adult_cleaned$occupation_grouped <- dplyr::recode(adult_cleaned$occupation,
+  "Exec-managerial" = "White-Collar",
+  "Prof-specialty"  = "White-Collar",
+
+  "Craft-repair"        = "Blue-Collar",
+  "Machine-op-inspct"   = "Blue-Collar",
+  "Transport-moving"    = "Blue-Collar",
+  "Handlers-cleaners"   = "Blue-Collar",
+  "Farming-fishing"     = "Blue-Collar",
+
+  "Adm-clerical"  = "Office",
+  "Tech-support"  = "Office",
+
+  "Sales" = "Sales",
+
+  "Other-service"     = "Service",
+  "Protective-serv"   = "Service",
+  "Priv-house-serv"   = "Service",
+  "Armed-Forces"      = "Service"
+)
+adult_cleaned <- adult_cleaned[, c("occupation_grouped", setdiff(names(adult_cleaned), "occupation_grouped"))]
+
+#(2)Workclass
+adult_cleaned$workclass_grouped  <- dplyr::recode(adult_cleaned$workclass,
+  "Private"           = "Private",
+  "Self-emp-not-inc"  = "Self-Employed",
+  "Self-emp-inc"      = "Self-Employed",
+  "Federal-gov"       = "Government",
+  "State-gov"         = "Government",
+  "Local-gov"         = "Government",
+  "Without-pay"       = "Without-pay"
+)
+
+#(3)native.country
+adult_cleaned$native.country_grouped <- ifelse(
+  adult_cleaned$native.country %in% c("United-States", "Unknown"),
+  adult_cleaned$native.country,
+  "Other"
+)
+
+#(4)marital.status
+adult_cleaned$marital_grouped <- dplyr::recode(adult_cleaned$marital.status,
+  "Married-civ-spouse"     = "Married",
+  "Never-married"          = "Single",
+  "Divorced"               = "Separated/Other",
+  "Separated"              = "Separated/Other",
+  "Widowed"                = "Separated/Other",
+  "Married-spouse-absent"  = "Separated/Other",
+  "Married-AF-spouse"      = "Separated/Other"
+)
+
+#(5)race
+adult_cleaned$race_grouped <- ifelse(
+  adult_cleaned$race == "White",
+  "White",
+  "Non-White"
+)
+
+#(6)relationship
+adult_cleaned$relationship_grouped <- dplyr::recode(adult_cleaned$relationship,
+  "Husband"         = "In-family",
+  "Wife"            = "In-family",
+  "Own-child"       = "In-family",
+  "Other-relative"  = "In-family",
+  "Unmarried"       = "Unmarried",
+  "Not-in-family"   = "Not-in-family"
+)
+
+#Delete the original redundant variable column
+adult_cleaned <- adult_cleaned %>%
+  dplyr::select(-c(occupation, workclass, native.country, marital.status, race, relationship))
+```
+
+### 2.5 Data encoding
+
+Converting target and other categorical variables to factor type. By
+converting these variables to factor type, R to treat them as
+categorical features. In addition, it improves model interpretability
+and efficiency.
+
+```{r message = FALSE}
+adult_cleaned$occupation_grouped <- as.factor(adult_cleaned$occupation_grouped)
+adult_cleaned$workclass_grouped <- as.factor(adult_cleaned$workclass_grouped)
+adult_cleaned$native.country_grouped <- as.factor(adult_cleaned$native.country_grouped)
+adult_cleaned$marital_grouped <- as.factor(adult_cleaned$marital_grouped)
+adult_cleaned$race_grouped <- as.factor(adult_cleaned$race_grouped)
+adult_cleaned$relationship_grouped <- as.factor(adult_cleaned$relationship_grouped)
+adult_cleaned$gender <- as.factor(adult_cleaned$gender)
+adult_cleaned$income <- as.factor(adult_cleaned$income)
+```
+
+## 3.Exploratory Data Analysis{.tabset}
+
+### 3.1 Overview of Target Variable
+
+In the histogram of the target variable, although there are still some
+imbalances, all categories contain a sufficient number of samples that
+can be used for supervised classification. It is notable that
+Blue-Collar is the largest group, accounting for nearly one-third of the
+dataset, while Sales is the smallest group. This distribution provides a
+relatively balanced basis for training multi-category classification
+models.
+
+```{r fig.height=2.7}
+options(repr.plot.width = 6, repr.plot.height = 4)
+ggplot(adult_cleaned, aes(x = occupation_grouped, fill = occupation_grouped)) +
+  geom_bar(width = 0.6) +
+  labs(title = "Distribution of Target Variable: Occupation Grouped",
+       x = "Occupation Group",
+       y = "Count") +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+```
+
+### 3.2 Numerical variables analysis
+
+To evaluate the discriminative ability of numerical variables for
+occupational categories, we drew box plots between age, education.num,
+and hours.per.week and occupation_grouped. The results show that these
+three variables have obvious structural differences from the
+occupational categories and have good predictive value.
+
+(1)From the age box plot, the overall median age of the White-Collar
+category is the highest, while the Service and Office occupational
+groups are relatively younger. However, the age distribution of the
+Blue-Collar and Sales categories is more dispersed, including more young
+and elderly groups. This indicates that age has the ability to identify
+among different occupational groups.\
+(2)The box plot differences of educational years are more significant:
+The median of educational years in the White-Collar category is the
+highest, and the interquartile range is relatively high, indicating that
+this type of occupation has a higher requirement for educational level.
+In contrast, the Blue-Collar and Service occupations are mainly
+concentrated at the secondary education level and have a relatively
+concentrated distribution, indicating that the years of education are an
+important variable for differentiating occupational types.\
+(3)In terms of working hours, the median working hours of Sales and
+White-Collar are generally higher than those of other categories, and
+the overall dispersion is relatively large, while the working hours of
+Office and Blue-Collar are relatively concentrated. Extreme working
+hours (such as more than 60 hours) are more common in Sales and
+White-Collar, which may reflect the work intensity or flexibility of
+these occupations.
+
+In conclusion, the three numerical variables all show meaningful
+distribution differences among different occupational categories,
+providing solid feature support for the construction of the occupational
+prediction model.Furthermore, we examined whether there were extreme
+values or potential erroneous values in the three numerical variables.
+The maximum age observed was 90 years old, the highest years of
+education was 16 years, and the longest working hours per week was 99
+hours. All these values are within a reasonable and reliable range,
+indicating that they are very likely to be real cases in the real world
+(for example, older professionals or self-employed individuals with
+longer working hours). Therefore, no outliers were removed or pruned,
+and all original observations were retained to ensure data integrity.
+
+```{r, fig.width=7, fig.height=6}
+num_long <- adult_cleaned %>%
+  dplyr::select(occupation_grouped, age, educational.num, hours.per.week) %>%
+  pivot_longer(cols = c(age, educational.num, hours.per.week),
+               names_to = "Variable",
+               values_to = "Value")
+
+ggplot(num_long, aes(x = occupation_grouped, y = Value, fill = occupation_grouped)) +
+  geom_boxplot(alpha = 0.5, outlier.color = "red", outlier.size = 1.5) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 1) +
+  labs(title = "Boxplots of Numerical Variables by Occupation",
+       x = "Occupation Group", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
+    strip.text = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, hjust = 0.5),
+    panel.spacing = unit(1.5, "lines")
+  )
+```
+
+### 3.3 Categorical variables analysis
+
+In this section, we selected three representative categorical variables:
+workclass, marital s.status, and gender, and analyzed their relationship
+with the target variable occupation_grouped. All the charts are
+presented in the form of proportional stacked bar charts to visually
+observe the changing trends of the occupational distribution under
+different categories of each variable and determine their potential for
+differentiating occupational categories in prediction.\
+(1)There is an obvious correlation between workclass_grouped and the
+target variable occupation_grouped. As can be seen from the figure, in
+the Government department, the proportion of White-Collar occupations is
+the highest, while in the Private and Self-Employed categories,
+Blue-Collar occupations are dominant. Without-pay almost completely
+corresponds to Blue-Collar. The differences in the occupational
+structures of various categories are relatively significant, indicating
+that the type of work can reflect the level or nature of the occupation
+an individual is engaged in and is a characteristic variable with
+predictive value.\
+(2)marital_grouped and occupation_grouped also show a certain structural
+relationship. Married individuals are more inclined to engage in
+Blue-Collar and White-Collar occupations, while among the unmarried
+population, the proportion of Sales and Service type occupations is
+relatively high, and Separated/Other occupations tend to be Office
+occupations. This difference may reflect the potential impact of marital
+status on career stability and employment choices. Therefore, the
+marital status variable has a certain explanatory power when predicting
+career categories.\
+(3)Gender has a significant influence on the distribution of
+occupations. It can be seen from the figure that the proportion of
+Blue-Collar occupations is higher among the male group, while the
+distribution among the female group is more balanced in the three
+categories of Office, Service and Sales. This difference indicates that
+gender is not only closely related to the type of occupation, but may
+also reflect the influence of social gender roles on career choices.
+Therefore, gender is an important variable with a high discriminatory
+ability.
+
+```{r, fig.width=6, fig.height=5.5}
+base_theme <- theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
+    plot.title = element_text(hjust = 0.5, size = 13),
+    legend.position = "right"
+  )
+p1 <- ggplot(adult_cleaned, aes(x = workclass_grouped, fill = occupation_grouped)) +
+  geom_bar(position = "fill") +
+  labs(title = "Occupation Distribution by Workclass",
+       x = "Workclass", y = "Proportion") +
+  base_theme
+p2 <- ggplot(adult_cleaned, aes(x = marital_grouped, fill = occupation_grouped)) +
+  geom_bar(position = "fill") +
+  labs(title = "Occupation Distribution by Marital Status",
+       x = "Marital Status", y = "Proportion") +
+  base_theme
+p3 <- ggplot(adult_cleaned, aes(x = gender, fill = occupation_grouped)) +
+  geom_bar(position = "fill") +
+  labs(title = "Occupation Distribution by Gender",
+       x = "Gender", y = "Proportion") +
+  base_theme
+plot_grid(p1, p2, p3, ncol = 1, align = "v", rel_heights = c(1.1, 1.1, 0.9))
+```
+
+### 3.4 Checking numerical variable correlations
+
+To evaluate the potential multicollinearity among numerical features, we
+calculated the Pearson correlation coefficients among age,
+educational.num and hours.per.week. As shown in the correlation matrix,
+all pairwise correlations are lower than 0.5, indicating a weak linear
+relationship. This indicates that there is no significant collinearity
+or redundancy among the numerical variables, and all variables can be
+retained for subsequent modeling.
+
+```{r fig.width=5, fig.height=4}
+numeric_data <- adult_cleaned %>% dplyr::select(age, educational.num, hours.per.week)
+cor_matrix <- cor(numeric_data, method = "pearson")
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", number.cex = 0.8)
+```
+
+## 4.Classification Models Used
+This project aims to predict an individual's occupational category
+through a multi-category classification method, using socio-economic and
+demographic attributes. We use four supervised learning models,
+including multiple logistic regression, Linear Discriminant
+Analysis(LDA), K-Nearest Neighbors (KNN), and Random Forest, to explore
+different perspectives of classification. These models were chosen
+because they have complementary advantages in terms of interpretability,
+statistical basis, adaptability to nonlinear patterns, and robustness to
+feature diversity, and can comprehensively evaluate the accuracy of
+career predictions.
+
+### Logistic Regression (multinomial)
+The following code is based on the Multinomial Logistic Regression model and performs multi-classification prediction tasks for individual occupational categories. After conducting exclusive coding and standardization processing on socio-economic and demographic characteristics, the model fits on the training set and makes predictions on the test set. The final output includes the confusion matrix, various precisions, recall rates and F1 values, as well as macro average indicators and overall accuracy rates, which are used to comprehensively evaluate the performance of the model in this multi-category classification task.
+
+```{r warning=FALSE}
+# One-hot Encoding
+df_encoded <- model.matrix(~ . - occupation_grouped, data = adult_cleaned) %>% as.data.frame()
+df_encoded$occupation_grouped <- adult_cleaned$occupation_grouped
+
+# Divide the training and test sets
+set.seed(5003)
+split_index <- createDataPartition(df_encoded$occupation_grouped, p = 0.8, list = FALSE)
+train_data <- df_encoded[split_index, ]
+test_data <- df_encoded[-split_index, ]
+
+# Feature standardization
+train_x <- train_data[, !names(train_data) %in% "occupation_grouped"]
+test_x <- test_data[, !names(test_data) %in% "occupation_grouped"]
+preProc <- preProcess(train_x, method = c("center", "scale"))
+train_scaled <- predict(preProc, train_x)
+test_scaled <- predict(preProc, test_x)
+train_scaled$occupation_grouped <- train_data$occupation_grouped
+test_scaled$occupation_grouped <- test_data$occupation_grouped
+
+```
+The base multinomial logistic regression model worked well for common classes but had difficulty with less frequent ones. This showed that the default settings could not fully handle the imbalance in the data. One possible reason is that the model did not generalize well in a high-dimensional and sparse feature space created by one-hot encoding. To address this, regularization was added by tuning the parameter C, which controls the strength of the penalty. A range of values was chosen: 0.01, 0.1, 1, 10, and 100. This range covers both strong and weak regularization. Smaller values like 0.01 apply stronger penalties to reduce overfitting. Larger values like 100 allow the model to fit the data more freely. The value 1 was included as a balanced middle point. Trying this range helps find the best trade-off between underfitting and overfitting.
+
+```{r}
+# Prepare training and test data
+x <- as.matrix(train_scaled[, !names(train_scaled) %in% "occupation_grouped"])
+y <- train_scaled$occupation_grouped
+x_test <- as.matrix(test_scaled[, !names(test_scaled) %in% "occupation_grouped"])
+y_test <- test_scaled$occupation_grouped
+
+# Step 1: Tune C by specifying lambda = 1/C
+C_values <- c(0.01, 0.1, 1, 10, 100)
+lambda_values <- 1 / C_values
+
+set.seed(5003)
+cv_model <- cv.glmnet(
+  x, y,
+  family = "multinomial",
+  type.multinomial = "ungrouped",
+  alpha = 0,
+  nfolds = 10,
+  lambda = lambda_values
+)
+
+best_lambda <- cv_model$lambda.min
+best_C <- 1 / best_lambda
+cat("Best lambda:", best_lambda, "\n")
+cat("Best C:", best_C, "\n")
+
+# Step 2: Retrain with best lambda
+final_model <- glmnet(
+  x, y,
+  family = "multinomial",
+  type.multinomial = "ungrouped",
+  alpha = 0,
+  lambda = best_lambda
+)
+
+# Step 3: Make predictions on test set
+preds <- predict(final_model, newx = x_test, s = best_lambda, type = "class")
+preds <- factor(preds, levels = levels(y_test))
+
+# Step 4: Evaluate
+truth <- y_test
+classes <- levels(truth)
+
+class_metrics <- data.frame(
+  Class = classes,
+  Precision = numeric(length(classes)),
+  Recall = numeric(length(classes)),
+  F1 = numeric(length(classes))
+)
+
+for (i in seq_along(classes)) {
+  class_i <- classes[i]
+  tp <- sum(preds == class_i & truth == class_i)
+  fp <- sum(preds == class_i & truth != class_i)
+  fn <- sum(preds != class_i & truth == class_i)
+  
+  precision <- if ((tp + fp) == 0) 0 else tp / (tp + fp)
+  recall <- if ((tp + fn) == 0) 0 else tp / (tp + fn)
+  f1 <- if ((precision + recall) == 0) 0 else 2 * precision * recall / (precision + recall)
+  
+  class_metrics[i, "Precision"] <- round(precision, 4)
+  class_metrics[i, "Recall"] <- round(recall, 4)
+  class_metrics[i, "F1"] <- round(f1, 4)
+}
+
+
+# Reorganize per-class metrics for kable
+log_per_class_metrics <- data.frame(
+  Category = class_metrics$Class,
+  Precision = class_metrics$Precision,
+  Recall = class_metrics$Recall,
+  F1 = class_metrics$F1
+)
+
+# Compute macro-averaged metrics
+macro_precision <- mean(log_per_class_metrics$Precision, na.rm = TRUE)
+macro_recall <- mean(log_per_class_metrics$Recall, na.rm = TRUE)
+macro_f1 <- mean(log_per_class_metrics$F1, na.rm = TRUE)
+
+# Overall accuracy
+accuracy <- mean(preds == truth)
+
+
+# Macro-averaged metrics
+log_macro_df <- data.frame(
+  Metric = c("Macro Precision", "Macro Recall", "Macro F1-score"),
+  Value = round(c(macro_precision, macro_recall, macro_f1), 4)
+)
+
+# Overall accuracy
+log_overall_df <- data.frame(Metric = "Accuracy", Value = round(accuracy, 4))
+
+# Display tables
+kable(log_overall_df, caption = "Logistic Regression (Tuned) - Overall Accuracy")
+kable(log_per_class_metrics, caption = "Logistic Regression (Tuned) - Per-Class Performance Metrics")
+kable(log_macro_df, caption = "Logistic Regression (Tuned) - Macro-Averaged Performance Metrics")
+```
+
+After applying L2-regularized multinomial logistic regression with parameter tuning, the model reached an improved accuracy of 0.5483. Using 10-fold cross-validation, the best regularization strength was found at lambda = 0.01 (C = 100), which gave the lowest deviance. The model performed well on common classes such as Blue-Collar and White-Collar, with F1-scores of 0.6843 and 0.6489, and some gains in the Office category. However, performance on rare classes remained poor. The Sales category had an F1-score of just 0.0107, and Service also stayed low at 0.2377. The macro precision, recall, and F1-score were 0.4566, 0.4272, and 0.3984, reflecting a modest improvement but still uneven performance.
+
+### Linear Discriminant Analysis (LDA)
+The following R code implements a linear Discriminant Analysis (LDA) model for handling multi-category classification tasks that predict occupational categories based on demographic and socio-economic characteristics. This model is trained using repeated 10-fold cross-validation to ensure robustness and generalization ability. After training, the model's performance is evaluated on a held-out test set using key classification metrics, including precision, recall, and F1-score for each class, as well as macro-averaged scores and overall accuracy.
+```{r message=FALSE, warning=FALSE}
+set.seed(42)
+train_index <- createDataPartition(adult_cleaned$occupation_grouped, p = 0.8, list = FALSE)
+train_data <- adult_cleaned[train_index, ]
+test_data <- adult_cleaned[-train_index, ]
+
+# Build the training controller (repeat 10-fold cross-validation three times)
+ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+
+# Train the LDA model
+lda_model <- train(occupation_grouped ~ ., 
+                   data = train_data, 
+                   method = "lda", 
+                   trControl = ctrl)
+
+# Model prediction
+lda_pred <- predict(lda_model, newdata = test_data)
+
+# Generate the confusion matrix
+lda_conf_matrix <- confusionMatrix(lda_pred, test_data$occupation_grouped)
+lda_acc <- mean(lda_pred == test_data$occupation_grouped)
+
+# Output the Precision, Recall and F1-score of each category
+lda_by_class <- as.data.frame(lda_conf_matrix$byClass)
+lda_by_class$Category <- rownames(lda_by_class)
+lda_per_class_metrics <- lda_by_class %>%
+  dplyr::select(Precision, Recall, F1) %>%
+  mutate(across(c(Precision, Recall, F1), ~ round(.x, 4)))
+
+# Macro averages
+lda_macro_precision <- mean(lda_per_class_metrics$Precision, na.rm = TRUE)
+lda_macro_recall <- mean(lda_per_class_metrics$Recall, na.rm = TRUE)
+lda_macro_f1 <- mean(lda_per_class_metrics$F1, na.rm = TRUE)
+
+# Overall accuracy
+lda_overall_df <- data.frame(Metric = "Accuracy", Value = round(lda_acc, 4))
+kable(lda_overall_df, caption = "LDA - Overall Accuracy")
+
+# Per-class metrics table
+kable(lda_per_class_metrics, caption = "LDA - Per-Class Performance Metrics")
+
+# Macro-averaged performance
+lda_macro_df <- data.frame(
+  Metric = c("Macro Precision", "Macro Recall", "Macro F1-score"),
+  Value = round(c(lda_macro_precision, lda_macro_recall, lda_macro_f1), 4)
+)
+kable(lda_macro_df, caption = "LDA - Macro-Averaged Performance Metrics")
+```
+The LDA model achieved an overall accuracy rate of 53.65% in predicting occupational categories. The category evaluation shows that this model performs strongly in categories such as Blue-Collar (F1 = 0.6803) and White-Collar (F1 = 0.6222), while the Sales performance is poor (F1 = 0.0105), which may be caused by category imbalance or feature overlap. The macro-averaged precision, recall, and F1-score were 0.4233, 0.4209, and 0.3903, respectively, indicating that the overall performance of the model was moderate. However, there is still room for improvement in the underrepresented categories.
+
+### K-Nearest Neighbors (KNN)
+To effectively identify the occupational category of individuals, this part of the code builds a classification model based on the K-Nearest Neighbor (KNN) algorithm. Since KNN belongs to distance-based algorithms, data preprocessing is particularly crucial in the modeling process. It helps to unify the variable scale and avoid unfair distance calculation and prediction biases caused by different feature dimensions. Therefore, the model is trained on the standardized processed data and the optimal hyperparameter combination (k value and distance metric) is selected through 10 folded cross-validation. The final model makes predictions on the test set and outputs the overall accuracy rate, the precision of each category, the recall rate and the F1 score, as well as the macro average metric, to comprehensively evaluate its performance in multi-category classification tasks.
+
+```{r message=FALSE}
+# Save the target variable before encoding
+labels <- adult_cleaned$occupation_grouped
+
+# One-hot encode all predictors; remove intercept and exclude the target variable
+adult_encoded <- model.matrix(~ . - occupation_grouped - 1, data = adult_cleaned)
+adult_encoded <- as.data.frame(adult_encoded)
+
+# Splitting the encoded dataset into training and testing sets
+set.seed(5003)
+train_index <- sample(1:nrow(adult_encoded), size = 0.8 * nrow(adult_encoded))
+
+train_data <- adult_encoded[train_index, ]
+test_data  <- adult_encoded[-train_index, ]
+
+# Extract corresponding labels
+train_labels <- labels[train_index]
+test_labels  <- labels[-train_index]
+
+# Standardize features using training set parameters
+train_data_scaled <- scale(train_data)
+
+test_data_scaled <- scale(
+  test_data,
+  center = attr(train_data_scaled, "scaled:center"),
+  scale  = attr(train_data_scaled, "scaled:scale")
+)
+```
+
+To optimize the KNN model, we adopted the 10-fold cross-validation method and tested the odd values of k from 61 to 81 respectively under the Manhattan distance and the Euclidean distance. This range was chosen because in previous experiments, the accuracy of the model continued to rise when k ranged from 1 to 61, and a stable performance platform area had not yet emerged. Cross-validation helps us evaluate each set of hyperparameter combinations among multiple validations, effectively reducing the risk of overfitting and improving the reliability of performance evaluation. The results in hyper-parameter tuning show that when the Manhattan distance is used and k = 81, the model performs the best, with an average cross-validation accuracy rate of approximately 53.9%. Subsequently, we retrained the model with this optimal parameter on the complete training set and conducted the final evaluation on an independent test set.
+
+```{r}
+# Prepare training and testing datasets
+train_df <- data.frame(train_data_scaled)
+train_df$occupation_grouped <- as.factor(train_labels)
+
+test_df <- data.frame(test_data_scaled)
+test_df$occupation_grouped <- as.factor(test_labels)
+
+# Define hyperparameter search space for k and prepare cross-validation folds
+k_values <- seq(61, 81, by = 2)
+folds <- createFolds(train_labels, k = 10, list = TRUE)
+
+# Placeholder for results
+cv_results <- data.frame(
+  k = integer(),
+  distance = character(),
+  fold = integer(),
+  accuracy = numeric()
+)
+
+# Loop over distances
+for (dist in c(1, 2)) {  # 1 = Manhattan, 2 = Euclidean
+  dist_name <- ifelse(dist == 1, "Manhattan", "Euclidean")
+
+  # Loop over folds
+  for (i in seq_along(folds)) {
+    val_index <- folds[[i]]
+    train_index <- setdiff(seq_len(nrow(train_df)), val_index)
+
+    fold_train <- train_df[train_index, ]
+    fold_val <- train_df[val_index, ]
+
+    # Loop over k values
+    for (k in k_values) {
+      model <- kknn(
+        occupation_grouped ~ .,
+        train = fold_train,
+        test = fold_val,
+        k = k,
+        distance = dist
+      )
+
+      pred <- fitted(model)
+      acc <- mean(pred == fold_val$occupation_grouped)
+
+      cv_results <- rbind(cv_results, data.frame(
+        k = k,
+        distance = dist_name,
+        fold = i,
+        accuracy = acc
+      ))
+    }
+  }
+}
+
+avg_results <- cv_results %>%
+  group_by(k, distance) %>%
+  summarise(mean_accuracy = mean(accuracy), .groups = "drop")
+
+# Best k for each distance
+best_k_by_distance <- avg_results %>%
+  group_by(distance) %>%
+  slice_max(mean_accuracy)
+
+print(best_k_by_distance)
+
+# Pick the overall best model (highest mean_accuracy)
+best_row <- best_k_by_distance[which.max(best_k_by_distance$mean_accuracy), ]
+
+final_k <- best_row$k
+final_distance <- ifelse(best_row$distance == "Manhattan", 1, 2)
+
+cat("Final model: distance =", best_row$distance, ", k =", final_k, "\n")
+```
+
+According to the final result of k-NN model training the Manhattan distance and k = 81 performs the best in the model.
+
+```{r}
+# Train model using best parameters
+final_knn_model <- kknn(
+  occupation_grouped ~ .,
+  train = train_df,
+  test = test_df,
+  k = final_k,
+  distance = final_distance
+)
+
+# Predictions
+final_pred <- fitted(final_knn_model)
+
+# Confusion matrix
+final_conf <- confusionMatrix(final_pred, test_df$occupation_grouped)
+
+# Overall accuracy
+knn_acc <- mean(final_pred == test_df$occupation_grouped)
+
+# Extract class-level metrics
+knn_by_class <- as.data.frame(final_conf$byClass)
+knn_by_class <- tibble::rownames_to_column(knn_by_class, var = "Category")
+
+# Precision, Recall, F1
+knn_per_class_metrics <- knn_by_class %>%
+  dplyr::select(Precision, Recall, F1) %>%
+  mutate(across(c(Precision, Recall, F1), ~ round(.x, 4)))
+
+# Add class names as the first column
+rownames(knn_per_class_metrics) <- c(
+  "Class: Blue-Collar", "Class: Office", "Class: Sales",
+  "Class: Service", "Class: White-Collar"
+)
+kable(knn_per_class_metrics, caption = "KNN - Per-Class Performance Metrics")
+
+# Macro averages
+knn_macro_precision <- mean(knn_per_class_metrics$Precision, na.rm = TRUE)
+knn_macro_recall <- mean(knn_per_class_metrics$Recall, na.rm = TRUE)
+knn_macro_f1 <- mean(knn_per_class_metrics$F1, na.rm = TRUE)
+
+# Overall accuracy dataframe
+knn_overall_df <- data.frame(Metric = "Accuracy", Value = round(knn_acc, 4))
+kable(knn_overall_df, caption = "KNN - Overall Accuracy")
+
+# Per-class performance metrics table
+kable(knn_per_class_metrics, caption = "KNN - Per-Class Performance Metrics")
+
+# Macro-averaged performance metrics
+knn_macro_df <- data.frame(
+  Metric = c("Macro Precision", "Macro Recall", "Macro F1-score"),
+  Value = round(c(knn_macro_precision, knn_macro_recall, knn_macro_f1), 4)
+)
+kable(knn_macro_df, caption = "KNN - Macro-Averaged Performance Metrics")
+```
+The k-NN model achieved an overall accuracy rate of 53.82% in predicting occupational categories. The category evaluation shows that this model performs strongly in categories such as Blue-Collar (F1 = 0.6720) and White-Collar (F1 = 0.6281), while the Sales performance is poor (F1 = 0.0681). The macro-averaged precision, recall, and F1-score were 0.4542, 0.4338, and 0.4191, respectively, indicating that the overall performance of the model was moderate.
+
+### Random Forest
+This code realizes the multi-classification prediction of occupational categories based on the random forest model with class weights. To solve the problem of category imbalance, a category weighting strategy was introduced during the model training process. Higher weights were assigned to the occupational categories with a smaller number of samples in the training set, thereby guiding the model to learn the features of various categories more evenly without changing the original data distribution.
+
+In terms of hyperparameter optimization, a series of 'mtry' parameter values were evaluated by combining 10-fold cross-validation of category weights, and the optimal parameters were selected based on the average classification error rate. The results show that the model performs best when 'mtry = 6', and the corresponding minimum cross-validation error is 0.5637. Finally, the complete model is trained under this parameter configuration, and the overall accuracy rate, Precision, Recall and F1 scores of each category, as well as the macro average metric, are output to comprehensively evaluate the model performance.
+```{r cross-validation, echo=FALSE}
+set.seed(42)
+n <- nrow(adult_cleaned)
+train_idx <- sample(seq_len(n), size = 0.8 * n)
+train_data <- adult_cleaned[train_idx, ]
+test_data  <- adult_cleaned[-train_idx, ]
+
+# Set the candidate values of mtry
+p <- ncol(train_data) - 1  
+candidate_mtry <- seq(1, p, by = 1)
+
+n_train <- nrow(train_data)
+folds <- sample(rep(1:10, length.out = n_train))
+
+# Create class weights (the reciprocal of the number of class samples, then normalize)
+class_counts <- table(train_data$occupation_grouped)
+class_weights <- 1 / class_counts
+class_weights <- class_weights / sum(class_weights)
+class_weights_named <- as.list(class_weights)
+names(class_weights_named) <- names(class_counts)
+
+# Cross-validation selects the best mtry
+cv_results_rf <- data.frame(mtry = candidate_mtry, cv_error = NA)
+
+for(i in seq_along(candidate_mtry)) {
+  m <- candidate_mtry[i]
+  errors <- c()
+  for(k in 1:10) {
+    train_fold <- train_data[folds != k, ]
+    valid_fold <- train_data[folds == k, ]
+
+    rf_fold <- randomForest(occupation_grouped ~ ., data = train_fold, 
+                            mtry = m, ntree = 100, classwt = class_weights_named)
+    pred_fold <- predict(rf_fold, valid_fold)
+    err <- mean(pred_fold != valid_fold$occupation_grouped)
+    errors <- c(errors, err)
+  }
+  cv_results_rf$cv_error[i] <- mean(errors)
+}
+
+# Select the optimal mtry
+best_mtry_rf <- cv_results_rf$mtry[which.min(cv_results_rf$cv_error)]
+best_error_rf <- min(cv_results_rf$cv_error)
+
+best_mtry_df <- data.frame(
+  Metric = c("Best mtry", "Cross-Validation Error"),
+  Value = c(best_mtry_rf, round(best_error_rf, 4))
+)
+kable(best_mtry_df, caption = "Random Forest - Best mtry Selected by 10-fold CV (with Class Weights)")
+```
+
+```{r rf-final-model, echo=FALSE}
+# Train the final model with the optimal mtry and class weights
+set.seed(42)
+rf_model <- randomForest(occupation_grouped ~ ., data = train_data, 
+                         mtry = best_mtry_rf, ntree = 500,
+                         classwt = class_weights_named)
+
+# Model prediction
+rf_pred <- predict(rf_model, newdata = test_data)
+
+# Calculate the accuracy rate
+rf_acc <- mean(rf_pred == test_data$occupation_grouped)
+
+# Confusion matrix and various evaluation indicators
+rf_conf_matrix <- confusionMatrix(rf_pred, test_data$occupation_grouped)
+rf_by_class <- as.data.frame(rf_conf_matrix$byClass)
+rf_by_class$Category <- rownames(rf_by_class)
+rf_per_class_metrics <- rf_by_class %>%
+  dplyr::select(Precision, Recall, F1) %>%
+  mutate(across(c(Precision, Recall, F1), ~ round(.x, 4)))
+
+# Macro average index
+rf_macro_precision <- mean(rf_per_class_metrics$Precision, na.rm = TRUE)
+rf_macro_recall <- mean(rf_per_class_metrics$Recall, na.rm = TRUE)
+rf_macro_f1 <- mean(rf_per_class_metrics$F1, na.rm = TRUE)
+
+# Output the overall accuracy rate
+overall_rf_df <- data.frame(Metric = "Accuracy", Value = round(rf_acc, 4))
+kable(overall_rf_df, caption = "Random Forest - Overall Accuracy (with Class Weights)")
+
+# Table of indicators for each category
+kable(rf_per_class_metrics, caption = "Random Forest - Per-Class Performance Metrics (with Class Weights)")
+
+# Macro average table
+rf_macro_df <- data.frame(
+  Metric = c("Macro Precision", "Macro Recall", "Macro F1-score"),
+  Value = round(c(rf_macro_precision, rf_macro_recall, rf_macro_f1), 4)
+)
+kable(rf_macro_df, caption = "Random Forest - Macro-Averaged Performance Metrics (with Class Weights)")
+```
+After introducing category weights, the overall accuracy rate of the random forest model is 0.4417. In terms of the performance of each category, the model performs more prominently in the blue-collar and white-collar categories, with F1 scores of 0.5589 and 0.5450 respectively, while the prediction effect in categories such as sales and service is relatively weak. In terms of the macro average indicators, precision, recall and F1-score are 0.4240, 0.4179 and 0.4124 respectively, indicating that although the model performs well in some categories, there is still room for improvement overall, especially when dealing with the problem of category imbalance.
+
+## 5.Performance Evaluation
+
+### Multinomial logistic regression Results and Analysis
+
+The tuned multinomial logistic regression model achieved an overall accuracy of 0.5483, showing a clear improvement over the baseline. It performed well on major classes such as Blue-Collar and White-Collar, with F1-scores of 0.6843 and 0.6489, respectively. However, it still struggled with minority classes. The Sales category, for example, had an F1-score of only 0.0107. The macro-averaged F1-score increased to 0.3984, but the imbalance between classes remains a key challenge. As a result, while the model is reliable for major groups, it fails to generalize well to all categories. This limits its overall effectiveness and shows the need for further tuning or adjustment.
+
+### Random Forest Results and Analysis
+
+The overall accuracy of the model is moderate. However, the macro average metric indicates that the class imbalance has a significant impact on the model. It performs well in predicting Blue-Collar and White-Collar categories, with an F1-score ranging from 0.54 to 0.56. However, it performs poorly in predicting Sales and Service categories. Specifically, the Precision of Sales is only 20.56%, and the Recall is also low, at 33.51%. Through cross-validation, I found the optimal mtry = 6, with an error of 0.5637. However, there is still room for improvement.
+
+### k-Nearest Neighborhood Model Results and Analysis
+
+According to the result, a 10-fold cross-validation was performed to tune the KNN model across various $k$ values and distance metrics. The best performance was achieved using **Manhattan distance with $k = 81$** with a cross-validation accuracy of **53.85%**. When we retrained on the full training set and evaluated on the test set, the model maintained a consistent accuracy of **53.82%**, which confirmed a good generalization.
+
+Macro-averaged metrics showed a **precision of 0.4542**, **recall of 0.4338**, and **F1-score of 0.4191**. These results indicate that the model performs moderately well overall but still faces challenges in identifying minority or overlapping classes. A deeper look at the per-class evaluation metrics shows that the model performed best on the Blue-Collar and White-Collar classes. It achieves F1-scores of 0.6720 and 0.6281, respectively. Both categories also showed high recall values. It is suggesting that the model was effective in capturing the majority of instances belonging to these groups. However, performance on the Sales class was relatively poor, with an F1-score of just 0.0681 and recall of 3.88%. This indicates that the model failed to correctly identify most instances in this class. This problem could be due to class imbalance. In addition, the computational efficiency is comparably much more slower than other models in this assignment, which can be another point to consider while choosing this model.
+
+Overall, while the final model demonstrates reliable performance for dominant categories, its ability to generalize to minority classes is limited. Further improvements could be achieved through resampling techniques such as SMOTE, feature selection or dimensionality reduction, and experimenting with more complex classifiers. However, the model offers a practical starting point and highlights clear areas for improvement in handling underrepresented classes.
+
+
+## 6.Conclusion
